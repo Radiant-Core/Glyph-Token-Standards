@@ -186,9 +186,23 @@ Some protocol combinations are invalid or require specific pairings:
 | [1, 2] FT + NFT | ❌ | Invalid: mutually exclusive |
 | [4] dMint alone | ❌ | Invalid: must include FT (1) |
 | [5] Mutable alone | ❌ | Invalid: must include NFT (2) |
-| [6] Burn alone | ❌ | Invalid: burn is an action, not a token type |
+| [6] Burn alone | ❌ | Invalid: burn is an action marker, not a token type |
 | [7] Container alone | ❌ | Invalid: must include NFT (2) |
+| [8] Encrypted alone | ❌ | Invalid: must include NFT (2) |
+| [9] Timelock alone | ❌ | Invalid: must include Encrypted (8) |
+| [2, 9] NFT + Timelock | ❌ | Invalid: Timelock requires Encrypted (8) |
+| [2, 8, 9] NFT + Encrypted + Timelock | ✅ | Timelocked encrypted NFT |
 | [11] WAVE alone | ❌ | Invalid: must include NFT (2) and Mutable (5) |
+
+**Protocol Dependency Rules**:
+- `GLYPH_DMINT` (4) requires `GLYPH_FT` (1)
+- `GLYPH_MUT` (5) requires `GLYPH_NFT` (2)
+- `GLYPH_BURN` (6) is an **action marker** that must accompany a token type (FT or NFT)
+- `GLYPH_CONTAINER` (7) requires `GLYPH_NFT` (2)
+- `GLYPH_ENCRYPTED` (8) requires `GLYPH_NFT` (2)
+- `GLYPH_TIMELOCK` (9) requires `GLYPH_ENCRYPTED` (8)
+- `GLYPH_AUTHORITY` (10) requires `GLYPH_NFT` (2)
+- `GLYPH_WAVE` (11) requires `GLYPH_NFT` (2) AND `GLYPH_MUT` (5)
 
 Indexers MUST reject tokens with invalid protocol combinations.
 
@@ -280,8 +294,10 @@ This prevents front-running and enables efficient initial indexing.
 The commit hash is computed as:
 
 ```
-commit_hash = SHA256(canonical_metadata_bytes)
+commit_hash = SHA256(SHA256(canonical_metadata_bytes))
 ```
+
+**Note**: Double SHA256 is used for backwards compatibility with Glyph v1 implementations. This aligns with Bitcoin/Radiant conventions (txids, merkle roots) and maintains a single code path for commit validation across both versions.
 
 Where `canonical_metadata_bytes` is CBOR-encoded with:
 - Map keys sorted lexicographically
@@ -354,6 +370,34 @@ The flags byte encodes optional envelope components:
 | 3-6 | Reserved | Must be zero |
 | 7 | `is_reveal` | Style A: distinguish commit/reveal |
 
+### 7.4 Envelope Style Detection
+
+Indexers MUST detect envelope style by examining the script prefix:
+
+| Style | Detection | First Byte(s) |
+|-------|-----------|---------------|
+| A | `OP_RETURN` prefix | `0x6a` or `0x00 0x6a` |
+| B | `OP_3` prefix | `0x53` |
+
+**Detection Algorithm**:
+```python
+def detect_envelope_style(script: bytes) -> str:
+    if len(script) < 1:
+        return 'unknown'
+    if script[0] == 0x6a:  # OP_RETURN
+        return 'A'
+    if len(script) >= 2 and script[0] == 0x00 and script[1] == 0x6a:  # OP_FALSE OP_RETURN
+        return 'A'
+    if script[0] == 0x53:  # OP_3
+        return 'B'
+    return 'unknown'
+```
+
+**Notes**:
+- Style A is used for smaller payloads (≤100 KB) in OP_RETURN outputs
+- Style B is used for larger payloads in scriptSig (reveal) or witness data
+- Both styles use the same magic bytes (`gly`) for identification
+
 ---
 
 ## 8. Metadata Schema
@@ -387,7 +431,7 @@ The flags byte encodes optional envelope components:
 | Field | Type | Max Size | Required | Description |
 |-------|------|----------|----------|-------------|
 | `v` | integer | - | Yes | Version (2) |
-| `type` | string | 64 bytes | Yes | Token type identifier |
+| `type` | string | 64 bytes | No | Human-readable token type hint (e.g., "nft", "fungible_token"). **Note**: The `p` array is authoritative for token type determination. Indexers MUST derive token type from `p`, not from this field. |
 | `p` | array | 16 items | Yes | Protocol IDs |
 | `name` | string | 256 bytes | No | Display name |
 | `desc` | string | 4 KB | No | Description |
@@ -452,6 +496,10 @@ Where `commit_hash` is computed with `creator.sig` set to empty string during si
 
 ### 8.4 Content Model
 
+Glyph v2 supports two content formats: a full structured model and a compact shorthand for simple assets.
+
+#### Full Content Model (Recommended for complex assets)
+
 ```json
 {
   "content": {
@@ -485,6 +533,39 @@ Where `commit_hash` is computed with `creator.sig` set to empty string during si
   }
 }
 ```
+
+#### Compact Shorthand (v1-compatible, for simple inline content)
+
+For simple assets with a single inline file, the compact `main` shorthand saves ~100-150 bytes:
+
+```json
+{
+  "main": {
+    "t": "image/png",
+    "b": "<base64_or_raw_bytes>"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `t` | string | MIME type |
+| `b` | bytes | Raw content bytes (CBOR byte string) |
+
+**Indexer Behavior**: Indexers MUST normalize shorthand to full model internally:
+- `main.t` → `content.primary.mime`
+- `main.b` → inline content with `storage: "inline"`
+- Hash computed from `main.b` at index time
+
+**When to use each format**:
+| Use Case | Recommended Format |
+|----------|--------------------|
+| Simple NFT with single image | Shorthand (`main`) |
+| Multi-file asset | Full (`content`) |
+| External references (IPFS) | Full (`content.refs`) |
+| Content requiring hash verification | Full (`content`) |
+
+#### Full Model Field Specifications
 
 | Field | Required | Description |
 |-------|----------|-------------|
@@ -1581,6 +1662,95 @@ Existing v1 tokens can be "upgraded" to v2 by:
 | v1 wallet | Full support | Display as basic NFT/FT |
 | v2 wallet | Full support | Full support |
 
+### 21.4 Version Detection
+
+Indexers MUST detect Glyph version by checking the `v` field in metadata:
+
+```python
+def detect_glyph_version(metadata: dict) -> int:
+    """Detect Glyph version from metadata."""
+    if 'v' in metadata and metadata['v'] == 2:
+        return 2
+    return 1  # Legacy v1 (no version field or v=1)
+```
+
+**Version-Specific Behavior**:
+| Aspect | v1 | v2 |
+|--------|-----|-----|
+| `v` field | Optional/missing | Required (must be 2) |
+| `type` field | Content type ("object") | Optional token type hint |
+| `p` array | Protocol IDs | Protocol IDs (authoritative) |
+| Content model | `main` shorthand only | `main` or `content` |
+| Commit hash | `SHA256(SHA256(cbor))` | `SHA256(SHA256(cbor))` |
+
+### 21.5 Field Migration Guide
+
+Mapping between v1 and v2 field names:
+
+| v1 Field | v2 Equivalent | Notes |
+|----------|---------------|-------|
+| `main` | `content.primary` or `main` | v2 supports both; `main` is shorthand |
+| `main.t` | `content.primary.mime` | MIME type |
+| `main.b` | Inline content bytes | Raw bytes in CBOR |
+| `in` | `rels.container.ref` | Container reference |
+| `by` | `creator.pubkey` | Creator identification |
+| `attrs` | `app.data` or root `attrs` | Custom attributes |
+| `type` | Derived from `p` array | v2 uses protocols as authoritative |
+| `desc` or `description` | `desc` | Description field |
+| `image` or `icon` | `content.primary` or `preview.thumb` | Image content |
+
+**Migration Example**:
+
+*v1 Metadata*:
+```json
+{
+  "p": [2],
+  "name": "My NFT",
+  "type": "object",
+  "main": { "t": "image/png", "b": "<bytes>" },
+  "in": ["<container_ref_bytes>"],
+  "by": ["<author_ref_bytes>"]
+}
+```
+
+*v2 Equivalent*:
+```json
+{
+  "v": 2,
+  "p": [2],
+  "name": "My NFT",
+  "main": { "t": "image/png", "b": "<bytes>" },
+  "rels": {
+    "container": { "ref": "<container_token_ref>" }
+  },
+  "creator": { "pubkey": "<author_pubkey_hex>" }
+}
+```
+
+### 21.6 Container Reference Format
+
+**v1 Format**: Container references stored as byte arrays in `in` field:
+```json
+{ "in": [Uint8Array([...])] }
+```
+
+**v2 Format**: Structured object with optional index:
+```json
+{
+  "rels": {
+    "container": {
+      "ref": "<txid>:<vout>",
+      "index": 42
+    }
+  }
+}
+```
+
+**Indexer Normalization**: When processing v1 tokens, indexers SHOULD normalize container references:
+1. Convert byte array to `txid:vout` string format
+2. Store in `rels.container.ref` internally
+3. Set `index` to null if not provided
+
 ---
 
 ## 22. Security Considerations
@@ -1779,6 +1949,7 @@ See REP-3003 for comprehensive test vectors covering:
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.0-draft-3 | 2026-01-30 | **Compatibility Updates**: Changed commit hash to double SHA256 for v1 compatibility (Section 6.2). Added hybrid content model with v1-compatible `main` shorthand (Section 8.4). Made `type` field optional with `p` array as authoritative (Section 8.2). Added envelope style detection algorithm (Section 7.4). Added TIMELOCK requires ENCRYPTED validation (Section 3.5). Clarified BURN as action marker. Added version detection, field migration guide, and container reference format sections (Sections 21.4-21.6). |
 | 2.0-draft | 2026-01-25 | Initial Glyph v2 specification |
 | 2.0-draft-2 | 2026-01-26 | Added: Section 3.5 Protocol Combination Rules, Section 8.7 Soulbound Tokens, Section 9.4 Photon-Backed Decimals, Section 12.6 Burn Reorg Handling, Section 16.5 Minimum Encryption Parameters, Section 18.9 Authority Validation, Section 19.4 Subdomain Resolution, Section 20.4 Content Verification. Updated: Size limits to match Radiant-Core consensus (12 MB MAX_TX_SIZE), commit_outpoint description, creator signature pseudocode, timelock AND logic, type-specific content requirements, policy.transferable field. |
 
