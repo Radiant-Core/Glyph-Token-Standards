@@ -67,10 +67,12 @@ Glyph v2 extends this foundation with additional capabilities while maintaining 
 
 ### 1.3 Non-Goals
 
-- Consensus changes to Radiant-Core
 - Virtual machine or smart contract language
 - Cross-chain bridges (separate REP)
 - Token economics or governance models
+
+> **Note:** The Radiant V2 hard fork introduces OP_BLAKE3 and OP_K12 consensus opcodes
+> specifically to support Glyph v2 dMint on-chain PoW validation. See Section 11.4.
 
 ---
 
@@ -793,9 +795,9 @@ dMint enables proof-of-work token distribution:
 | ID | Algorithm | Memory | GPU Support | Notes |
 |----|-----------|--------|-------------|-------|
 | 0x00 | SHA256d | ~1 KB | Excellent | Backward compatible |
-| 0x01 | Blake3 | ~1 KB | Excellent | Primary new algorithm |
-| 0x02 | KangarooTwelve | ~200 B | Good | Phase 3 implementation |
-| 0x03 | Argon2id-Light | 64 MB | Fair | Memory-hard, Phase 3 |
+| 0x01 | Blake3 | ~1 KB | Excellent | OP_BLAKE3 (0xee) — implemented |
+| 0x02 | KangarooTwelve | ~200 B | Good | OP_K12 (0xef) — implemented |
+| 0x03 | Argon2id-Light | 64 MB | Fair | Memory-hard, deferred |
 | 0x04 | RandomX-Light | 256 MB | CPU only | CLI miner only, deferred |
 
 ### 11.3 DAA Modes
@@ -808,25 +810,141 @@ dMint enables proof-of-work token distribution:
 | 0x03 | LWMA | Linear weighted moving average |
 | 0x04 | Schedule | Predetermined difficulty curve |
 
-### 11.4 dMint Contract
+### 11.4 dMint Contract Variants
+
+With the Radiant V2 hard fork, all supported PoW algorithms (SHA256d, Blake3, K12) are
+validated fully on-chain via native opcodes. No indexer trust dependency is required.
+
+**v1 Contract (SHA256d tokens):**
+```
+<height:4B>
+OP_PUSHINPUTREFSINGLETON <contractRef:36B>
+OP_PUSHINPUTREF <tokenRef:36B>
+<maxHeight> <reward> <target>
+OP_STATESEPARATOR
+<v1_bytecode>  (validates SHA256d PoW + state transitions)
+```
+
+**v2 Contract (all algorithms — requires Hard Fork V2):**
+```
+<height:4B>
+OP_PUSHINPUTREFSINGLETON <contractRef:36B>
+OP_PUSHINPUTREF <tokenRef:36B>
+<maxHeight> <reward> <target>
+<algoId:1B>
+<lastTime:4B>
+<targetTime:minimal>
+OP_STATESEPARATOR
+<v2_bytecode>  (validates algorithm-specific PoW + state transitions + on-chain DAA)
+```
+
+| Token Config | Contract | On-Chain PoW | DAA |
+|-------------|----------|-------------|-----|
+| v1 token (no `dmint` in CBOR) | v1 contract | SHA256d (OP_HASH256) | Fixed |
+| v2 + algo=SHA256d + fixed | v1 contract | SHA256d (OP_HASH256) | Fixed |
+| v2 + algo=SHA256d + dynamic | v2-sha256d | SHA256d (OP_HASH256) | On-chain |
+| v2 + algo=blake3 | v2-blake3 | Blake3 (OP_BLAKE3) | On-chain |
+| v2 + algo=k12 | v2-k12 | K12 (OP_K12) | On-chain |
+
+> **Note:** Argon2id (memory-hard) is deferred to a future fork pending DoS analysis
+> for on-chain memory-bound computation.
+
+> **See also:** [V2 dMint Design Specification](../Glyph-miner/docs/V2_DMINT_DESIGN.md)
+> for exact byte layouts, buffer formats, DAA computation, and miner integration details.
+
+### 11.4.1 On-Chain DAA Bytecode Specification
+
+The v2 contract computes difficulty adjustment entirely in script using native opcodes.
+The miner sets `nLockTime` to the current UNIX timestamp, which the contract reads via
+`OP_TXLOCKTIME`. The activation height for these opcodes is **block 410,000** on mainnet.
+
+#### ASERT-Lite Algorithm (Recommended Default)
+
+The ASERT-lite DAA uses discrete power-of-2 adjustments via `OP_LSHIFT`/`OP_RSHIFT`:
 
 ```
-<height:4>
-OP_PUSHINPUTREFSINGLETON <contractRef>
-OP_PUSHINPUTREF <tokenRef>
-<maxHeight> <reward> <target>
-<algoId> <daaMode> <daaParams>
-OP_STATESEPARATOR
-<contract_bytecode>
+// ── Read timestamps ──────────────────────────────────
+//   Stack at entry: ... <old_target> <lastTime> <targetTime>
+OP_TXLOCKTIME              // push current_time from nLockTime
+OP_SWAP                    // ... old_target lastTime current_time targetTime
+OP_2 OP_PICK               // ... old_target lastTime current_time targetTime lastTime
+OP_SUB                     // time_delta = current_time - lastTime
+
+// ── Compute drift ────────────────────────────────────
+//   drift = (time_delta - targetTime) / halfLife
+//   halfLife is embedded as an immediate in the bytecode
+OP_SWAP                    // ... old_target lastTime time_delta targetTime
+OP_SUB                     // excess = time_delta - targetTime
+<halfLife>                 // push halfLife constant (e.g., 3600)
+OP_DIV                     // drift = excess / halfLife (integer, signed)
+
+// ── Clamp drift to [-4, +4] ─────────────────────────
+OP_DUP OP_4 OP_GREATERTHAN OP_IF OP_DROP OP_4 OP_ENDIF
+OP_DUP OP_4 OP_NEGATE OP_LESSTHAN OP_IF OP_DROP OP_4 OP_NEGATE OP_ENDIF
+
+// ── Apply shift to target ────────────────────────────
+//   drift > 0: target <<= drift  (easier, larger target)
+//   drift < 0: target >>= |drift| (harder, smaller target)
+//   drift == 0: no change
+OP_DUP OP_0 OP_GREATERTHAN
+OP_IF
+    OP_LSHIFT              // new_target = old_target << drift
+OP_ELSE
+    OP_DUP OP_0 OP_LESSTHAN
+    OP_IF
+        OP_NEGATE          // |drift|
+        OP_RSHIFT          // new_target = old_target >> |drift|
+    OP_ELSE
+        OP_DROP            // drift == 0, target unchanged
+    OP_ENDIF
+OP_ENDIF
+
+// ── Clamp target to [MIN_TARGET, MAX_TARGET] ─────────
+// MIN_TARGET = 1 (prevents zero/negative target)
+// MAX_TARGET = contract-defined ceiling
+OP_DUP OP_1 OP_LESSTHAN OP_IF OP_DROP OP_1 OP_ENDIF
 ```
+
+**Opcode budget:** ~35 opcodes for the full DAA computation, well within the 32M op limit.
+
+#### Linear DAA (Simpler Alternative)
+
+For contracts that prefer simpler math without bitwise shifts:
+
+```
+// new_target = old_target * time_delta / targetTime
+//   Stack: ... <old_target> <time_delta> <targetTime>
+OP_2 OP_PICK               // ... old_target time_delta targetTime old_target
+OP_2 OP_PICK               // ... old_target time_delta targetTime old_target time_delta
+OP_MUL                     // ... old_target time_delta targetTime (old_target * time_delta)
+OP_SWAP                    // ... old_target time_delta (old_target * time_delta) targetTime
+OP_DIV                     // new_target = old_target * time_delta / targetTime
+
+// Clamp to [MIN_TARGET, MAX_TARGET]
+OP_DUP OP_1 OP_LESSTHAN OP_IF OP_DROP OP_1 OP_ENDIF
+```
+
+#### Security Constraints
+
+| Constraint | Value | Enforced By |
+|-----------|-------|-------------|
+| Max shift per mint | ±4 bits | Contract bytecode (clamp) |
+| Timestamp source | `nLockTime` | `OP_TXLOCKTIME` |
+| Timestamp bounds | Consensus MTP ≤ nLockTime ≤ MTP + 2hr | Radiant Core consensus |
+| Min target | 1 | Contract bytecode (clamp) |
+| Half-life | Immutable per contract | Embedded in bytecode |
+| 64-bit overflow | Protected | Radiant uses 64-bit `CScriptNum` |
 
 ### 11.5 Mining Process
 
-1. Miner fetches current contract state
-2. Computes valid nonce: `hash(preimage + nonce) < target`
-3. Submits claim transaction with solution
-4. Contract validates and awards tokens
-5. State updates: height++, difficulty adjusts
+1. Miner fetches current contract UTXO state (on-chain): height, target, algoId, lastTime
+2. Target is read directly from the on-chain state (no indexer dependency)
+3. Computes valid nonce: `algorithm_hash(preimage + nonce) < target`
+4. Submits claim transaction with solution (nLockTime set to current time for DAA)
+5. On-chain contract validates PoW using algorithm-specific opcode (OP_HASH256 / OP_BLAKE3 / OP_K12)
+6. On-chain contract computes DAA target adjustment using OP_LSHIFT/OP_RSHIFT or OP_MUL/OP_DIV
+7. State updates: height++, target adjusts, lastTime updates
+8. Indexer indexes mint for analytics/discovery (optional, not trust-critical)
 
 ### 11.6 Collision Mitigation
 
@@ -1932,6 +2050,94 @@ See REP-3003 for comprehensive test vectors covering:
 | 3014 | Burn Mechanism |
 | 3015 | Authority Tokens |
 
+### Appendix E: V2 dMint Contract Bytecodes
+
+#### E.1 V1 Contract Bytecode (SHA256d, Fixed Difficulty)
+
+Used for: v1 tokens and v2 tokens with `algo=SHA256d` + `daa=fixed`.
+
+```
+5175c0c855797ea8597959797ea87e5a7a7eaabc01147f77587f
+040000000088817600a269a269577ae500a069567ae600a06901
+d053797e0cdec0e9aa76e378e4a269e69d7eaa76e47b9d547a81
+8b76537a9c537ade789181547ae6939d635279cd01d853797e01
+6a7e886778de519d547854807ec0eb557f777e5379ec78885379
+eac0e9885379cc519d75686d7551
+```
+
+#### E.2 V2 Contract Bytecode Template (Pseudocode)
+
+All v2 contracts share the same structure, differing only in the hash opcode used for PoW
+validation. The `<powHashOp>` placeholder is replaced per algorithm:
+
+| Algorithm | `<powHashOp>` | Opcode Byte |
+|-----------|--------------|-------------|
+| SHA256d | `OP_HASH256` | `0xaa` |
+| Blake3 | `OP_BLAKE3` | `0xee` |
+| K12 | `OP_K12` | `0xef` |
+
+**V2 contract pseudocode (with on-chain DAA):**
+
+```
+// ═══ PART A: State validation + PoW check ═══════════
+// Stack from scriptSig: <nonce> <preimage>
+
+// 1. Verify height < maxHeight
+<old_height> OP_1ADD                    // new_height
+OP_DUP <maxHeight> OP_LESSTHAN OP_VERIFY
+
+// 2. Validate PoW
+OP_OVER OP_OVER OP_CAT                 // preimage || nonce
+<powHashOp>                             // hash(preimage || nonce)
+OP_DUP                                  // keep hash for target check
+
+// 3. Check hash < target (256-bit comparison for blake3/k12)
+//    For SHA256d: first 4 bytes == 0, next 8 bytes < target
+<target> OP_LESSTHAN OP_VERIFY
+
+// 4. Verify contractRef singleton preserved
+OP_PUSHINPUTREFSINGLETON <contractRef>
+OP_DROP
+
+// 5. Verify tokenRef output with correct reward
+OP_PUSHINPUTREF <tokenRef>
+OP_DROP
+
+// ═══ PART B: DAA computation (see §11.4.1) ══════════
+// Read old state: lastTime, targetTime
+// Compute new target via ASERT-lite or Linear DAA
+// (exact bytecode per §11.4.1)
+
+// ═══ PART C: Output script continuity ════════════════
+// Verify output script matches input (except mutable state)
+// Store: new_height, new_target, current_time as lastTime
+```
+
+**Activation:** Block **410,000** on mainnet (Radiant Core `radiantCore2UpgradeHeight`).
+
+#### E.3 Contract Script Layout Summary
+
+```
+┌──── State Data (mutable per mint) ────────────────────┐
+│ <height:4B>                                            │
+│ OP_PUSHINPUTREFSINGLETON(d8) <contractRef:36B>         │
+│ OP_PUSHINPUTREF(d0) <tokenRef:36B>                     │
+│ <maxHeight:minimal>  <reward:minimal>  <target:minimal>│
+│ <algoId:1B>  <lastTime:4B>  <targetTime:minimal>       │  ← v2 only
+├──── Separator ─────────────────────────────────────────┤
+│ OP_STATESEPARATOR(bd)                                  │
+├──── Bytecode (immutable) ──────────────────────────────┤
+│ PART_A: state validation + PoW (<powHashOp>) check     │
+│ PART_B: on-chain DAA (OP_LSHIFT/OP_RSHIFT or MUL/DIV) │  ← v2 only
+│ PART_C: output script continuity + token distribution  │
+└────────────────────────────────────────────────────────┘
+```
+
+> **Note:** The exact compiled bytecodes for v2-sha256d, v2-blake3, and v2-k12 contracts
+> will be finalized during testnet integration (Phase 10) and published as immutable
+> reference implementations. See the [V2 dMint Design Specification](../Glyph-miner/docs/V2_DMINT_DESIGN.md)
+> for buffer formats and miner integration details.
+
 ---
 
 ## References
@@ -1942,6 +2148,8 @@ See REP-3003 for comprehensive test vectors covering:
 4. RFC 8785: JSON Canonicalization Scheme (JCS)
 5. RFC 7693: The BLAKE2 Cryptographic Hash
 6. RFC 9106: Argon2 Memory-Hard Function
+7. BLAKE3 — https://github.com/BLAKE3-team/BLAKE3
+8. KangarooTwelve — https://keccak.team/kangarootwelve.html
 
 ---
 
@@ -1949,6 +2157,8 @@ See REP-3003 for comprehensive test vectors covering:
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.0-draft-5 | 2026-02-10 | **DAA Bytecode Spec & Contract Appendix**: Added §11.4.1 On-Chain DAA Bytecode Specification (ASERT-lite pseudocode with OP_LSHIFT/OP_RSHIFT, linear DAA alternative, security constraints table). Added Appendix E: V2 dMint Contract Bytecodes (v1 hex reference, v2 pseudocode template with `<powHashOp>` per algorithm, script layout summary). Activation height: block 410,000 on mainnet. |
+| 2.0-draft-4 | 2026-02-10 | **Hard Fork Integration**: Updated §1.3 to acknowledge V2 consensus changes. Updated §11.2 POW algorithm table with OP_BLAKE3/OP_K12 implementation status. Revised §11.4 intro to reflect fully on-chain PoW validation (no indexer trust). Added BLAKE3 and KangarooTwelve references. |
 | 2.0-draft-3 | 2026-01-30 | **Compatibility Updates**: Changed commit hash to double SHA256 for v1 compatibility (Section 6.2). Added hybrid content model with v1-compatible `main` shorthand (Section 8.4). Made `type` field optional with `p` array as authoritative (Section 8.2). Added envelope style detection algorithm (Section 7.4). Added TIMELOCK requires ENCRYPTED validation (Section 3.5). Clarified BURN as action marker. Added version detection, field migration guide, and container reference format sections (Sections 21.4-21.6). |
 | 2.0-draft | 2026-01-25 | Initial Glyph v2 specification |
 | 2.0-draft-2 | 2026-01-26 | Added: Section 3.5 Protocol Combination Rules, Section 8.7 Soulbound Tokens, Section 9.4 Photon-Backed Decimals, Section 12.6 Burn Reorg Handling, Section 16.5 Minimum Encryption Parameters, Section 18.9 Authority Validation, Section 19.4 Subdomain Resolution, Section 20.4 Content Verification. Updated: Size limits to match Radiant-Core consensus (12 MB MAX_TX_SIZE), commit_outpoint description, creator signature pseudocode, timelock AND logic, type-specific content requirements, policy.transferable field. |
