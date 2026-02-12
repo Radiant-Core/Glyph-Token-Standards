@@ -1,8 +1,8 @@
 # Glyph v2: A Unified Token Standard for the Radiant Blockchain
 
-**Version:** 2.0  
-**Date:** January 2026  
-**Status:** Draft  
+**Version:** 2.0-draft-8  
+**Date:** February 2026  
+**Status:** Release Candidate  
 
 ---
 
@@ -10,7 +10,9 @@
 
 Glyph v2 is a comprehensive token standard for the Radiant blockchain that unifies fungible tokens, non-fungible tokens, smart assets, and naming services under a single, extensible framework. Building on the proven Glyph v1 foundation, v2 introduces enhanced features including on-chain royalty enforcement, explicit burn mechanisms, container/collection support, encrypted content, timelocked reveals, and integration with the WAVE naming system.
 
-The standard leverages Radiant's unique UTXO model with induction proofs and reference system to provide true digital ownership with cryptographic guarantees. Glyph v2 is designed for developers, creators, and indexers with a focus on clarity, extensibility, and ease of implementation.
+The standard leverages Radiant's unique UTXO model with induction proofs and reference system to provide true digital ownership with cryptographic guarantees. With the Radiant V2 hard fork (block 410,000), Glyph v2 dMint achieves fully on-chain proof-of-work validation via native hash opcodes (OP_BLAKE3, OP_K12), eliminating all indexer trust dependencies for decentralized minting.
+
+Glyph v2 is designed for developers, creators, and indexers with a focus on clarity, extensibility, and ease of implementation.
 
 ---
 
@@ -27,6 +29,7 @@ The standard leverages Radiant's unique UTXO model with induction proofs and ref
 9. [Fungible Tokens](#9-fungible-tokens)
 10. [Non-Fungible Tokens](#10-non-fungible-tokens)
 11. [Decentralized Minting (dMint)](#11-decentralized-minting-dmint)
+    - 11.4.1 [On-Chain DAA Bytecode Specification](#1141-on-chain-daa-bytecode-specification)
 12. [Burn Mechanism](#12-burn-mechanism)
 13. [On-Chain Royalties](#13-on-chain-royalties)
 14. [Containers and Collections](#14-containers-and-collections)
@@ -40,6 +43,11 @@ The standard leverages Radiant's unique UTXO model with induction proofs and ref
 22. [Security Considerations](#22-security-considerations)
 23. [Reference Implementation](#23-reference-implementation)
 24. [Appendices](#24-appendices)
+    - A. [Protocol ID Registry](#appendix-a-protocol-id-registry)
+    - B. [CBOR Encoding Rules](#appendix-b-cbor-encoding-rules)
+    - C. [Size Limits Summary](#appendix-c-size-limits-summary)
+    - D. [Related REPs](#appendix-d-related-reps)
+    - E. [V2 dMint Contract Bytecodes](#appendix-e-v2-dmint-contract-bytecodes)
 
 ---
 
@@ -71,8 +79,11 @@ Glyph v2 extends this foundation with additional capabilities while maintaining 
 - Cross-chain bridges (separate REP)
 - Token economics or governance models
 
-> **Note:** The Radiant V2 hard fork introduces OP_BLAKE3 and OP_K12 consensus opcodes
-> specifically to support Glyph v2 dMint on-chain PoW validation. See Section 11.4.
+> **Note:** The Radiant V2 hard fork introduces six consensus opcode changes to support
+> Glyph v2 dMint: **OP_BLAKE3** (0xee) and **OP_K12** (0xef) for on-chain PoW validation,
+> **OP_LSHIFT** (0x98) and **OP_RSHIFT** (0x99) for on-chain DAA bit-shift arithmetic,
+> and **OP_2MUL** (0x8d) and **OP_2DIV** (0x8e) for efficient multiply/divide by 2.
+> All six opcodes activate at block 410,000 on mainnet. See Section 11.4.
 
 ---
 
@@ -261,8 +272,8 @@ Radiant's generous limits enable rich on-chain content:
 
 | Limit | Value | Notes |
 |-------|-------|-------|
-| `MAX_STANDARD_TX_SIZE` | 20 MB | Policy limit for relay |
 | `MAX_TX_SIZE` | 12 MB | Consensus maximum |
+| `MAX_STANDARD_TX_SIZE` | 20 MB | Policy limit for relay (see §7.2) |
 | `MAX_SCRIPT_SIZE` | 10 KB | Maximum script length (standard) |
 | `MAX_SCRIPT_ELEMENT_SIZE` | 520 bytes | Maximum bytes per push (standard) |
 
@@ -358,7 +369,7 @@ OP_3 <PUSHDATA(MAGIC)>
      [<PUSHDATA(file_chunk)>...]
 ```
 
-**Maximum size**: Limited by `MAX_TX_SIZE` (12 MB consensus limit). Transactions up to `MAX_STANDARD_TX_SIZE` (20 MB) are accepted for relay but exceed consensus limits.
+**Maximum size**: Limited by `MAX_TX_SIZE` (12 MB consensus limit). `MAX_STANDARD_TX_SIZE` (20 MB) is a policy constant but has no practical effect since consensus rejects transactions exceeding 12 MB.
 
 ### 7.3 Flags Byte
 
@@ -471,6 +482,13 @@ If `creator` is present as an object (not just a pubkey string), it enables prov
 | `sig` | string | Signature over commit hash, hex-encoded |
 | `algo` | string | `ecdsa-secp256k1` or `schnorr-secp256k1` |
 
+**Signature Formats**:
+
+| `algo` | Format | Size |
+|--------|--------|------|
+| `ecdsa-secp256k1` | DER-encoded | 70–72 bytes |
+| `schnorr-secp256k1` | Raw (r \|\| s) | 64 bytes |
+
 **Signed message**: `SHA256("glyph-v2-creator:" || commit_hash)`
 
 Where `commit_hash` is computed with `creator.sig` set to empty string during signing.
@@ -478,18 +496,18 @@ Where `commit_hash` is computed with `creator.sig` set to empty string during si
 **Signing Process (Pseudocode)**:
 ```
 1. metadata_for_hash = metadata with creator.sig = ""
-2. commit_hash = SHA256(CBOR(metadata_for_hash))
+2. commit_hash = SHA256(SHA256(CBOR(metadata_for_hash)))
 3. message = SHA256("glyph-v2-creator:" || commit_hash)
 4. sig = SIGN(message, private_key)
 5. metadata.creator.sig = hex(sig)
-6. final_commit_hash = SHA256(CBOR(metadata))  // This goes in commit envelope
+6. final_commit_hash = SHA256(SHA256(CBOR(metadata)))  // This goes in commit envelope
 ```
 
 **Verification Process**:
 ```
 1. Extract creator.sig from metadata
 2. Set creator.sig = "" in metadata copy
-3. temp_hash = SHA256(CBOR(metadata_copy))
+3. temp_hash = SHA256(SHA256(CBOR(metadata_copy)))
 4. message = SHA256("glyph-v2-creator:" || temp_hash)
 5. VERIFY(sig, message, pubkey) using algo
 ```
@@ -866,26 +884,36 @@ The ASERT-lite DAA uses discrete power-of-2 adjustments via `OP_LSHIFT`/`OP_RSHI
 // ── Read timestamps ──────────────────────────────────
 //   Stack at entry: ... <old_target> <lastTime> <targetTime>
 OP_TXLOCKTIME              // push current_time from nLockTime
-OP_SWAP                    // ... old_target lastTime current_time targetTime
-OP_2 OP_PICK               // ... old_target lastTime current_time targetTime lastTime
+                           // ... old_target lastTime targetTime current_time
+OP_2 OP_PICK               // copy lastTime (index 2 from top)
+                           // ... old_target lastTime targetTime current_time lastTime
 OP_SUB                     // time_delta = current_time - lastTime
+                           // ... old_target lastTime targetTime time_delta
 
 // ── Compute drift ────────────────────────────────────
 //   drift = (time_delta - targetTime) / halfLife
 //   halfLife is embedded as an immediate in the bytecode
 OP_SWAP                    // ... old_target lastTime time_delta targetTime
 OP_SUB                     // excess = time_delta - targetTime
+                           // ... old_target lastTime excess
 <halfLife>                 // push halfLife constant (e.g., 3600)
 OP_DIV                     // drift = excess / halfLife (integer, signed)
+                           // ... old_target lastTime drift
 
 // ── Clamp drift to [-4, +4] ─────────────────────────
 OP_DUP OP_4 OP_GREATERTHAN OP_IF OP_DROP OP_4 OP_ENDIF
 OP_DUP OP_4 OP_NEGATE OP_LESSTHAN OP_IF OP_DROP OP_4 OP_NEGATE OP_ENDIF
+                           // ... old_target lastTime drift
+
+// ── Rearrange stack for shift ────────────────────────
+OP_ROT                     // ... lastTime drift old_target
+OP_SWAP                    // ... lastTime old_target drift
 
 // ── Apply shift to target ────────────────────────────
 //   drift > 0: target <<= drift  (easier, larger target)
 //   drift < 0: target >>= |drift| (harder, smaller target)
 //   drift == 0: no change
+//   OP_LSHIFT/OP_RSHIFT: (x n -- x<<n) / (x n -- x>>n)
 OP_DUP OP_0 OP_GREATERTHAN
 OP_IF
     OP_LSHIFT              // new_target = old_target << drift
@@ -898,6 +926,7 @@ OP_ELSE
         OP_DROP            // drift == 0, target unchanged
     OP_ENDIF
 OP_ENDIF
+                           // ... lastTime new_target
 
 // ── Clamp target to [MIN_TARGET, MAX_TARGET] ─────────
 // MIN_TARGET = 1 (prevents zero/negative target)
@@ -905,11 +934,15 @@ OP_ENDIF
 OP_DUP OP_1 OP_LESSTHAN OP_IF OP_DROP OP_1 OP_ENDIF
 ```
 
-**Opcode budget:** ~35 opcodes for the full DAA computation, well within the 32M op limit.
+**Opcode budget:** ~38 opcodes for the full DAA computation, well within the 32M op limit.
 
 #### Linear DAA (Simpler Alternative)
 
-For contracts that prefer simpler math without bitwise shifts:
+For contracts that prefer simpler math without bitwise shifts.
+
+> **Note:** The Linear DAA reuses the same timestamp extraction as ASERT-lite (reading
+> `OP_TXLOCKTIME`, copying `lastTime` via `OP_PICK`, computing `time_delta`). The
+> pseudocode below begins after `time_delta` is on the stack.
 
 ```
 // new_target = old_target * time_delta / targetTime
@@ -934,6 +967,10 @@ OP_DUP OP_1 OP_LESSTHAN OP_IF OP_DROP OP_1 OP_ENDIF
 | Min target | 1 | Contract bytecode (clamp) |
 | Half-life | Immutable per contract | Embedded in bytecode |
 | 64-bit overflow | Protected | Radiant uses 64-bit `CScriptNum` |
+
+> **Additional arithmetic opcodes:** `OP_2MUL` (0x8d) and `OP_2DIV` (0x8e) are also
+> re-enabled at block 410,000. These provide efficient multiply/divide by 2 as
+> alternatives to single-bit shifts, useful for DAA arithmetic and contract logic.
 
 ### 11.5 Mining Process
 
@@ -960,7 +997,6 @@ When multiple miners work on the same low-difficulty contract, valid solutions a
    | SHA256d | 500,000 | ~30 seconds |
    | Blake3 | 2,500,000 | ~30 seconds |
    | K12 | 2,000,000 | ~30 seconds |
-   | Argon2id-Light | 50,000 | ~30 seconds |
 
 3. **Wallet Warnings**: When difficulty is below recommended minimum, wallets should display:
    > "⚠️ Low difficulty may result in ~X% of solutions being orphaned due to collisions with other miners."
@@ -991,6 +1027,139 @@ When multiple miners work on the same low-difficulty contract, valid solutions a
 }
 ```
 
+**Algorithm Name Mapping**: CBOR metadata uses human-readable string names. On-chain contract
+state uses integer byte IDs. The canonical mapping is:
+
+| Metadata String | On-Chain ID | PoW Opcode |
+|-----------------|-------------|------------|
+| `"sha256d"` | `0x00` | `OP_HASH256` (0xaa) |
+| `"blake3"` | `0x01` | `OP_BLAKE3` (0xee) |
+| `"k12"` | `0x02` | `OP_K12` (0xef) |
+
+Indexers and wallets MUST use this mapping when translating between metadata and contract state.
+
+**DAA Mode Mapping**: The `daa.mode` string in CBOR metadata maps to on-chain DAA mode IDs:
+
+| Metadata String | On-Chain ID | Description |
+|-----------------|-------------|-------------|
+| `"fixed"` | `0x00` | Static difficulty (no DAA bytecode) |
+| `"epoch"` | `0x01` | Bitcoin-style periodic adjustment |
+| `"asert"` | `0x02` | ASERT-lite (recommended, see §11.4.1) |
+| `"lwma"` | `0x03` | Linear weighted moving average |
+| `"schedule"` | `0x04` | Predetermined difficulty curve |
+
+### 11.8 Induction Proofs
+
+Radiant provides two independent mechanisms for mathematical induction proofs, enabling
+contracts to verify provenance and enforce rules across transaction boundaries in O(1)
+constant time and space.
+
+#### 11.8.1 Method 1: Reference-Based Induction
+
+The `OP_PUSHINPUTREF` family of opcodes creates an unbroken chain of provenance from a
+genesis (mint) transaction to the current UTXO. This is the primary mechanism used by
+all Glyph token contracts.
+
+**How it works:**
+- **Base case P(0):** At genesis, `OP_PUSHINPUTREF <ref>` is valid only if `<ref>` matches
+  one of the input outpoints being spent (the mint transaction).
+- **Inductive step P(k→k+1):** On every subsequent spend, the ref is valid only if at least
+  one parent input's output script already contains that same `OP_PUSHINPUTREF` value.
+- **Result:** Only the immediate parent inputs need to be checked — no history traversal.
+
+**Available reference opcodes:**
+
+| Opcode | Hex | Purpose |
+|--------|-----|---------|
+| `OP_PUSHINPUTREF` | 0xd0 | Push & propagate a 36-byte reference |
+| `OP_REQUIREINPUTREF` | 0xd1 | Require a reference exists in inputs (don't propagate) |
+| `OP_DISALLOWPUSHINPUTREF` | 0xd2 | Forbid a reference in this output |
+| `OP_DISALLOWPUSHINPUTREFSIBLING` | 0xd3 | Forbid a reference in sibling outputs |
+| `OP_PUSHINPUTREFSINGLETON` | 0xd8 | Push + disallow siblings (NFT shorthand) |
+
+**Code-continuity induction** combines references with introspection to verify that the
+parent UTXO used the same contract code. Since the parent also verified its parent, this
+creates an inductive chain guaranteeing all ancestors followed the same rules:
+
+```
+// RadiantScript: code-continuity induction step
+bytes myCodeScript = tx.inputs[this.activeInputIndex].codeScript;
+bytes32 myCodeHash = hash256(myCodeScript);
+require(tx.outputs.codeScriptCount(myCodeHash) >= 1);
+```
+
+#### 11.8.2 Method 2: TxId v3 Preimage Induction
+
+For general-purpose mathematical induction beyond reference tracking, Radiant supports
+**Transaction Identifier Version 3**. When `nVersion == 3`, the txid is computed from a
+fixed 112-byte preimage instead of the full serialized transaction, preventing the
+exponential size blowup that would otherwise occur when embedding parent transactions.
+
+**TxId v3 Preimage Layout (112 bytes):**
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 4B | nVersion | Transaction version (LE) |
+| 4 | 4B | nTotalInputs | Number of inputs (LE) |
+| 8 | 32B | hashPrevoutInputs | SHA256 of all input outpoints |
+| 40 | 32B | hashSequence | SHA256 of all input sequences |
+| 72 | 4B | nTotalOutputs | Number of outputs (LE) |
+| 76 | 32B | hashOutputHashes | SHA256 of concat of per-output SHA256 hashes |
+| 108 | 4B | nLocktime | Transaction locktime (LE) |
+
+**Usage pattern:** The caller provides the parent transaction's v3 preimage (112 bytes)
+in the unlocking script. The contract verifies `hash256(preimage)` matches the parent's
+txid via `tx.inputs[i].outpointTransactionHash`, then inspects individual fields:
+
+```
+// RadiantScript: v3 preimage induction
+bytes32 derivedParentTxId = hash256(parentPreimage);
+bytes32 actualParentTxId = tx.inputs[this.activeInputIndex].outpointTransactionHash;
+require(derivedParentTxId == actualParentTxId);
+
+// Extract and verify parent's version
+bytes4 parentVersion, bytes108 rest = parentPreimage.split(4);
+require(int(parentVersion) == 3);
+```
+
+This enables verification of arbitrary structural properties of ancestor transactions
+without requiring full transaction data or exponential size growth.
+
+#### 11.8.3 Transaction State Introspection (OP_PUSH_TX_STATE)
+
+`OP_PUSH_TX_STATE` (0xed) provides access to transaction-level computed values that
+complement induction proofs:
+
+| Field | RadiantScript | Description |
+|-------|---------------|-------------|
+| 0 | `tx.state.txId` | Current transaction's txid (v3-aware, bytes32) |
+| 1 | `tx.state.inputSum` | Total input value in photons (int) |
+| 2 | `tx.state.outputSum` | Total output value in photons (int) |
+
+These are useful for fee verification, value conservation checks, and self-referencing
+contract logic:
+
+```
+// RadiantScript: fee-bounded transfer
+int fee = tx.state.inputSum - tx.state.outputSum;
+require(fee >= 0);
+require(fee <= maxFee);
+```
+
+#### 11.8.4 Choosing the Right Method
+
+| Criterion | Method 1 (References) | Method 2 (TxId v3) |
+|-----------|----------------------|---------------------|
+| **Use case** | Token identity, NFTs, FTs | Arbitrary ancestor verification |
+| **Complexity** | Simple — single opcode | Complex — preimage parsing |
+| **Data overhead** | 0 bytes in unlocking script | 112 bytes per ancestor level |
+| **Verification** | Automatic by consensus | Explicit in contract logic |
+| **Typical usage** | All Glyph tokens | Advanced state machines, provenance proofs |
+
+For most token contracts, Method 1 with code-continuity introspection is sufficient and
+recommended. Method 2 is available for advanced use cases that require verification of
+specific structural properties of ancestor transactions.
+
 ---
 
 ## 12. Burn Mechanism
@@ -1007,12 +1176,15 @@ Glyph v2 introduces explicit burns with `GLYPH_BURN`:
 ```
 Inputs:
   [0] Token UTXO (tokenRef, 1000 photons)
-  [1] Fee funding UTXO
+  [1] Fee funding UTXO (e.g., 6,000,000 photons)
 
 Outputs:
   [0] Burn proof (OP_RETURN, 0 photons)
-  [1] Change to user (995 photons)
+  [1] Recovered token photons to user (1000 photons)
+  [2] Change from fee UTXO (remainder after tx fee)
 ```
+
+**Note**: The transaction fee is paid from the fee funding input, not from the token UTXO. Token photons are returned to the user in a separate output.
 
 ### 12.3 Burn Proof Format
 
@@ -1178,7 +1350,7 @@ When `enforced: false`:
 
 ### 14.3 Child Token Reference
 
-Child tokens reference their parent:
+Child tokens reference their parent. Children use their own protocol IDs (e.g., `[2]` for NFT) — the `GLYPH_CONTAINER` (7) protocol is only for the parent container token itself:
 
 ```json
 {
@@ -1248,6 +1420,8 @@ OP_PUSHINPUTREFSINGLETON <mutableRef>
 ```
 
 ### 15.4 Update Transaction
+
+**Ordering**: When multiple updates appear in the same block, indexers MUST process them in **transaction index order** within the block. If two updates reference the same `prev`, only the first (by tx index) is valid; subsequent conflicting updates MUST be rejected.
 
 ```json
 {
@@ -1545,6 +1719,10 @@ Authorities with `revocable: true` can be revoked by their issuer:
   }
 }
 ```
+
+> **Note:** Revocations use `p: [10]` as an **action marker** (similar to burn's `p: [6]`),
+> not as a token creation. The `GLYPH_AUTHORITY` (10) requires `GLYPH_NFT` (2) rule
+> from §3.5 applies only to authority **token creation**, not to action envelopes.
 
 ### 18.8 Container Integration
 
@@ -1913,9 +2091,8 @@ For encrypted content:
 
 Indexers MUST reject and not index a Glyph if:
 - `v` is missing or not equal to `2`
-- `type` is missing
+- `p` array is missing or empty
 - `name` exceeds 256 bytes
-- `policy` is missing or lacks required fields
 - Protocol combination is invalid (see Section 3.5)
 - Any `content.*.hash.hex` is malformed (invalid hex, wrong length)
 - Total canonical metadata exceeds 256 KB
@@ -1924,7 +2101,7 @@ Indexers MUST reject and not index a Glyph if:
 
 | Token Type | Content Requirement |
 |------------|---------------------|
-| NFT (`p` includes 2) | `content` with `primary` REQUIRED |
+| NFT (`p` includes 2) | `content` with `primary` REQUIRED, **or** `main` shorthand present (see §8.4) |
 | FT (`p` includes 1) | `content` OPTIONAL; `ticker` REQUIRED if no content |
 | DAT (`p` includes 3) | `content` OPTIONAL |
 | Container (`p` includes 7) | `content` OPTIONAL; `container` object REQUIRED |
@@ -1944,9 +2121,12 @@ Indexers MUST ignore unknown top-level keys and preserve them when re-serializin
 
 ### 23.1 Repositories
 
-- **Photonic Wallet**: Token creation and management
-- **Glyph Miner**: dMint mining client
-- **Glyph Indexer**: Reference indexer implementation
+- **Radiant Core**: Consensus node — [github.com/AustEcon/Radiant-Core](https://github.com/AustEcon/Radiant-Core)
+- **Photonic Wallet**: Token creation and management — [github.com/AustEcon/Photonic-Wallet](https://github.com/AustEcon/Photonic-Wallet)
+- **Glyph Miner**: dMint mining client — [github.com/AustEcon/Glyph-miner](https://github.com/AustEcon/Glyph-miner)
+- **RXinDexer**: Reference indexer implementation — [github.com/AustEcon/RXinDexer](https://github.com/AustEcon/RXinDexer)
+- **radiantjs**: JavaScript library — [github.com/AustEcon/radiantjs](https://github.com/AustEcon/radiantjs)
+- **RadiantScript**: Smart contract compiler — [github.com/AustEcon/RadiantScript](https://github.com/AustEcon/RadiantScript)
 
 ### 23.2 Libraries
 
@@ -2056,6 +2236,9 @@ See REP-3003 for comprehensive test vectors covering:
 
 Used for: v1 tokens and v2 tokens with `algo=SHA256d` + `daa=fixed`.
 
+> **Note:** This hex represents the bytecode **after** `OP_STATESEPARATOR` (0xbd).
+> The full script includes the state data prefix and `bd` separator before this bytecode.
+
 ```
 5175c0c855797ea8597959797ea87e5a7a7eaabc01147f77587f
 040000000088817600a269a269577ae500a069567ae600a06901
@@ -2133,9 +2316,9 @@ OP_DROP
 └────────────────────────────────────────────────────────┘
 ```
 
-> **Note:** The exact compiled bytecodes for v2-sha256d, v2-blake3, and v2-k12 contracts
-> will be finalized during testnet integration (Phase 10) and published as immutable
-> reference implementations. See the [V2 dMint Design Specification](../Glyph-miner/docs/V2_DMINT_DESIGN.md)
+> **Note:** The v2 contract bytecodes have been verified on 2-node regtest (all 7 integration
+> scenarios A–G passed, Feb 2026). The Photonic Wallet contains the production contract
+> bytecode templates. See the [V2 dMint Design Specification](../Glyph-miner/docs/V2_DMINT_DESIGN.md)
 > for buffer formats and miner integration details.
 
 ---
@@ -2157,11 +2340,14 @@ OP_DROP
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.0-draft-8 | 2026-02-12 | **Induction Proofs**: Added §11.8 Induction Proofs section covering Method 1 (reference-based, OP_PUSHINPUTREF family), Method 2 (TxId v3 preimage embedding with 112-byte layout), OP_PUSH_TX_STATE transaction state introspection (tx.state.txId, tx.state.inputSum, tx.state.outputSum), code-continuity induction pattern, and method comparison table. Added RadiantScript compiler support for tx.state.* nullary operators. Added InductionProof.rxd example contract. |
+| 2.0-draft-7 | 2026-02-12 | **Production Ready**: Updated status to Release Candidate. Added V2 hard fork summary to Executive Summary. Fixed §12.2 burn example (clarified fee source, added fee funding UTXO). Fixed §22.6 NFT content requirement to accept `main` shorthand (§8.4). Swapped §5 table rows (consensus MAX_TX_SIZE first). Added DAA mode string↔integer mapping table (§11.7). Added Linear DAA timestamp extraction note (§11.4.1). Added signature format/size table to §8.3. Clarified §14.3 child `p` array (CONTAINER is parent-only). Added §15.4 update ordering rules (tx index within block). Clarified §18.7 revocation `p:[10]` as action marker. Added GitHub repository URLs to §23.1. Updated Appendix E note (Phase 10 complete, bytecodes verified on regtest). |
+| 2.0-draft-6 | 2026-02-10 | **Audit Fixes**: Fixed §22.6 error handling (removed `type`/`policy` mandatory rejection; `p` array is authoritative per §8.2). Fixed §8.3 creator signature to use double SHA256 matching §6.2 commit hash. Fixed §11.4.1 ASERT-lite stack tracking bug (incorrect OP_SUB operand order). Added OP_ROT/OP_SWAP for correct stack rearrangement before shift. Updated §1.3 to list all 6 fork-gated opcodes. Added OP_2MUL/OP_2DIV note in §11.4.1. Added algorithm name mapping table in §11.7. Removed deferred Argon2id from §11.6 collision table. Added §11.4.1 and Appendix E to ToC. Fixed §7.2 MAX_STANDARD_TX_SIZE wording. Updated header to draft-6/Feb 2026. |
 | 2.0-draft-5 | 2026-02-10 | **DAA Bytecode Spec & Contract Appendix**: Added §11.4.1 On-Chain DAA Bytecode Specification (ASERT-lite pseudocode with OP_LSHIFT/OP_RSHIFT, linear DAA alternative, security constraints table). Added Appendix E: V2 dMint Contract Bytecodes (v1 hex reference, v2 pseudocode template with `<powHashOp>` per algorithm, script layout summary). Activation height: block 410,000 on mainnet. |
 | 2.0-draft-4 | 2026-02-10 | **Hard Fork Integration**: Updated §1.3 to acknowledge V2 consensus changes. Updated §11.2 POW algorithm table with OP_BLAKE3/OP_K12 implementation status. Revised §11.4 intro to reflect fully on-chain PoW validation (no indexer trust). Added BLAKE3 and KangarooTwelve references. |
 | 2.0-draft-3 | 2026-01-30 | **Compatibility Updates**: Changed commit hash to double SHA256 for v1 compatibility (Section 6.2). Added hybrid content model with v1-compatible `main` shorthand (Section 8.4). Made `type` field optional with `p` array as authoritative (Section 8.2). Added envelope style detection algorithm (Section 7.4). Added TIMELOCK requires ENCRYPTED validation (Section 3.5). Clarified BURN as action marker. Added version detection, field migration guide, and container reference format sections (Sections 21.4-21.6). |
-| 2.0-draft | 2026-01-25 | Initial Glyph v2 specification |
 | 2.0-draft-2 | 2026-01-26 | Added: Section 3.5 Protocol Combination Rules, Section 8.7 Soulbound Tokens, Section 9.4 Photon-Backed Decimals, Section 12.6 Burn Reorg Handling, Section 16.5 Minimum Encryption Parameters, Section 18.9 Authority Validation, Section 19.4 Subdomain Resolution, Section 20.4 Content Verification. Updated: Size limits to match Radiant-Core consensus (12 MB MAX_TX_SIZE), commit_outpoint description, creator signature pseudocode, timelock AND logic, type-specific content requirements, policy.transferable field. |
+| 2.0-draft | 2026-01-25 | Initial Glyph v2 specification |
 
 ---
 
