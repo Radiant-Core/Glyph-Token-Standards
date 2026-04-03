@@ -850,11 +850,19 @@ OP_PUSHINPUTREFSINGLETON <contractRef:36B>
 OP_PUSHINPUTREF <tokenRef:36B>
 <maxHeight> <reward> <target>
 <algoId:1B>
-<lastTime:4B>
-<targetTime:minimal>
+<daaMode:1B>
+<daaParams...:minimal ints>
 OP_STATESEPARATOR
 <v2_bytecode>  (validates algorithm-specific PoW + state transitions + on-chain DAA)
 ```
+
+`daaParams` are mode-dependent and interpreted by the bytecode selected at creation time.
+Common examples:
+- `fixed`: no extra params
+- `asert`: `<targetBlockTime> <halfLife> [asymptote]`
+- `epoch`: `<targetBlockTime> <epochLength> [maxAdjustment]`
+- `lwma`: `<targetBlockTime> <windowSize>`
+- `schedule`: implementation-defined compact schedule encoding
 
 | Token Config | Contract | On-Chain PoW | DAA |
 |-------------|----------|-------------|-----|
@@ -974,13 +982,13 @@ OP_DUP OP_1 OP_LESSTHAN OP_IF OP_DROP OP_1 OP_ENDIF
 
 ### 11.5 Mining Process
 
-1. Miner fetches current contract UTXO state (on-chain): height, target, algoId, lastTime
+1. Miner fetches current contract UTXO state (on-chain): height, target, algoId, daaMode, daaParams
 2. Target is read directly from the on-chain state (no indexer dependency)
 3. Computes valid nonce: `algorithm_hash(preimage + nonce) < target`
 4. Submits claim transaction with solution (nLockTime set to current time for DAA)
 5. On-chain contract validates PoW using algorithm-specific opcode (OP_HASH256 / OP_BLAKE3 / OP_K12)
-6. On-chain contract computes DAA target adjustment using OP_LSHIFT/OP_RSHIFT or OP_MUL/OP_DIV
-7. State updates: height++, target adjusts, lastTime updates
+6. On-chain contract computes DAA target adjustment using the selected mode (e.g., OP_LSHIFT/OP_RSHIFT or OP_MUL/OP_DIV)
+7. State updates: height++, target adjusts, and mode-specific state values update as defined by bytecode
 8. Indexer indexes mint for analytics/discovery (optional, not trust-critical)
 
 ### 11.6 Collision Mitigation
@@ -1013,22 +1021,25 @@ When multiple miners work on the same low-difficulty contract, valid solutions a
   "name": "Mineable Token",
   "ticker": "MINE",
   "dmint": {
-    "algorithm": "blake3",
-    "daa": {
-      "mode": "asert",
-      "baseDifficulty": 10,
-      "targetMintTime": 60,
-      "halflife": 3600
-    },
+    "algo": 1,
+    "numContracts": 16,
+    "diff": 2500000,
     "maxHeight": 10000,
     "reward": 100,
-    "premine": 0
+    "premine": 0,
+    "daa": {
+      "mode": 2,
+      "targetBlockTime": 60,
+      "halfLife": 3600
+    }
   }
 }
 ```
 
-**Algorithm Name Mapping**: CBOR metadata uses human-readable string names. On-chain contract
-state uses integer byte IDs. The canonical mapping is:
+Current Photonic wallet payloads encode `dmint.algo` and `dmint.daa.mode` as integer IDs.
+Wallet UIs may still expose human-readable names, but payload commit/tracking should use IDs.
+
+**Algorithm Mapping**: The canonical mapping is:
 
 | Metadata String | On-Chain ID | PoW Opcode |
 |-----------------|-------------|------------|
@@ -1036,9 +1047,10 @@ state uses integer byte IDs. The canonical mapping is:
 | `"blake3"` | `0x01` | `OP_BLAKE3` (0xee) |
 | `"k12"` | `0x02` | `OP_K12` (0xef) |
 
-Indexers and wallets MUST use this mapping when translating between metadata and contract state.
+Indexers and wallets MUST use this mapping when translating display values to payload IDs and when
+matching on-chain contract state.
 
-**DAA Mode Mapping**: The `daa.mode` string in CBOR metadata maps to on-chain DAA mode IDs:
+**DAA Mode Mapping**: `dmint.daa.mode` maps to on-chain DAA mode IDs:
 
 | Metadata String | On-Chain ID | Description |
 |-----------------|-------------|-------------|
@@ -1047,6 +1059,11 @@ Indexers and wallets MUST use this mapping when translating between metadata and
 | `"asert"` | `0x02` | ASERT-lite (recommended, see §11.4.1) |
 | `"lwma"` | `0x03` | Linear weighted moving average |
 | `"schedule"` | `0x04` | Predetermined difficulty curve |
+
+**Tracking fields (indexer/miner interoperability)**:
+- `dmint.algo`, `dmint.diff`, `dmint.maxHeight`, `dmint.reward`
+- `dmint.daa.mode`, `dmint.daa.targetBlockTime`, plus mode-specific params (`halfLife`, `windowSize`, `epochLength`, `maxAdjustment`, `schedule`)
+- On-chain state fields `algoId`, `daaMode`, and mode-specific `daaParams`
 
 ### 11.8 Induction Proofs
 
