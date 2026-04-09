@@ -2370,7 +2370,7 @@ OP_CAT                                  // concat halves
 ## References
 
 1. Satoshi Nakamoto, "Bitcoin: A Peer-to-Peer Electronic Cash System," 2008
-2. "Radiant: A Peer-to-Peer Digital Asset System," 2022
+2. Atoshi, "Radiant: A Peer-to-Peer Digital Asset System," 2022
 3. RFC 8949: Concise Binary Object Representation (CBOR)
 4. RFC 8785: JSON Canonicalization Scheme (JCS)
 5. RFC 7693: The BLAKE2 Cryptographic Hash
