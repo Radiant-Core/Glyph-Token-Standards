@@ -1,7 +1,7 @@
 # Glyph v2: A Unified Token Standard for the Radiant Blockchain
 
-**Version:** 2.0-draft-8  
-**Date:** February 2026  
+**Version:** 2.0-draft-11  
+**Date:** April 2026  
 **Status:** Release Candidate  
 
 ---
@@ -1496,10 +1496,20 @@ OP_PUSHINPUTREFSINGLETON <mutableRef>
 
 ### 16.1 Overview
 
-`GLYPH_ENCRYPTED` enables private content:
-- Ciphertext stored on-chain
-- Metadata describes encryption
-- Key delivery via passphrase or recipient wrapping
+`GLYPH_ENCRYPTED` enables private content with flexible storage backends:
+
+| Backend | Storage | Size Limit | Best For |
+|---------|---------|------------|----------|
+| **On-Chain (glyph)** | `main.b` as hex | 512 KB | Messages, credentials |
+| **IPFS** | Content-addressed (CID) | Unlimited | General use |
+| **Arweave** | Permanent blockchain | Unlimited | Legal docs, wills |
+| **Wallet Backend** | Server storage | Configurable | Fast UX default |
+
+**Architecture:**
+- Ciphertext stored according to selected backend
+- Encrypted locator (pointer + hash) stored on-chain for external backends
+- Key delivery via passphrase or X25519 recipient wrapping
+- Content hash enables integrity verification
 
 ### 16.2 Crypto Metadata
 
@@ -1556,7 +1566,106 @@ For multiple recipients, wrap the CEK per recipient:
 }
 ```
 
-### 16.5 Minimum Security Parameters
+### 16.5 Storage Backend Details
+
+#### 16.5.1 On-Chain Storage (glyph)
+
+Encrypted data stored directly in NFT metadata:
+
+```json
+{
+  "main": {
+    "type": "text/plain",
+    "b": "<hex-encoded-ciphertext>",
+    "enc": "xchacha20poly1305",
+    "size": 1024,
+    "chunks": 1,
+    "hash": "sha256:plaintext-hash"
+  }
+}
+```
+
+**Trade-offs:**
+- ✓ Self-sovereign (no external dependencies)
+- ✓ Atomic with NFT (single transaction)
+- ✗ Higher transaction fees
+- ✗ 512 KB practical limit (protocol allows more)
+- ✗ Metadata reveals encrypted content exists
+
+#### 16.5.2 IPFS Storage
+
+Encrypted blob uploaded to IPFS via NFT.Storage:
+
+```json
+{
+  "main": {
+    "type": "application/pdf",
+    "u": "ipfs://QmXxXxXx...",
+    "hash": "sha256:ciphertext-hash",
+    "size": 1048576,
+    "chunks": 32
+  },
+  "crypto": {
+    "locator": "<encrypted-base64>",
+    "locator_nonce": "<base64>"
+  }
+}
+```
+
+**Trade-offs:**
+- ✓ Unlimited size
+- ✓ Content-addressed integrity
+- ✓ Free with API key
+- ✗ Requires active pinning
+- ✗ Ciphertext publicly downloadable (CID leaks access)
+
+#### 16.5.3 Arweave Storage
+
+Encrypted blob stored permanently via Irys/Bundlr:
+
+```json
+{
+  "main": {
+    "type": "application/pdf",
+    "u": "ar://transaction-id",
+    "hash": "sha256:ciphertext-hash",
+    "size": 1048576,
+    "chunks": 32
+  }
+}
+```
+
+**Trade-offs:**
+- ✓ Permanent (200+ year guarantee)
+- ✓ No ongoing maintenance
+- ✓ Free ≤100 KB via Irys node2
+- ✗ Paid for larger files
+- ✗ Slower initial upload
+
+#### 16.5.4 Wallet Backend Storage
+
+Encrypted blob stored on Photonic Wallet servers:
+
+```json
+{
+  "main": {
+    "type": "text/plain",
+    "u": "backend://encrypted-id",
+    "hash": "sha256:ciphertext-hash",
+    "size": 1024,
+    "chunks": 1
+  }
+}
+```
+
+**Trade-offs:**
+- ✓ Fastest upload/download
+- ✓ No external API keys needed
+- ✓ Private (not on P2P networks)
+- ✗ Centralized to server operator
+- ✗ Server-dependent availability
+
+### 16.6 Minimum Security Parameters
 
 Implementations MUST reject encrypted glyphs with parameters below these thresholds:
 
@@ -2230,6 +2339,8 @@ See REP-3003 for comprehensive test vectors covering:
 
 ### Appendix C: Size Limits Summary
 
+#### C.1 Metadata Limits
+
 | Component | Limit | Notes |
 |-----------|-------|-------|
 | `name` | 256 bytes | UTF-8 encoded |
@@ -2243,6 +2354,23 @@ See REP-3003 for comprehensive test vectors covering:
 | Update envelope | 64 KB | Incremental changes |
 | Inline file | 1 MB | Per file |
 | Total inline | 10 MB | All files combined |
+
+#### C.2 Encrypted Content Limits
+
+| Storage Backend | Max Size | On-Chain Component | Notes |
+|-----------------|----------|-------------------|-------|
+| **On-Chain (glyph)** | 512 KB | Ciphertext in `main.b` | UX limit; protocol allows ~4 MB |
+| **IPFS** | Unlimited | Encrypted locator (256 bytes) | Requires pinning service |
+| **Arweave** | Unlimited | Encrypted locator (256 bytes) | Free ≤100 KB via Irys, paid larger |
+| **Wallet Backend** | Configurable | Encrypted locator (256 bytes) | Default 10 MB limit |
+
+**Encryption-Specific:**
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Chunk size | 32 KB | AEAD chunking for large files |
+| Nonce length | 24 bytes | XChaCha20-Poly1305 |
+| Key wrap overhead | ~48 bytes | Per recipient (X25519 + wrapped CEK) |
+| Locator encryption | XChaCha20-Poly1305 | Used for external storage pointers |
 
 **Consensus Limits** (from Radiant-Core):
 | Limit | Value |
@@ -2384,6 +2512,8 @@ OP_CAT                                  // concat halves
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.0-draft-11 | 2026-04-27 | **Encrypted Content Storage Backends**: Added comprehensive §16.5 Storage Backend Details covering four options: On-Chain (glyph) with 512 KB limit, IPFS (content-addressed), Arweave (permanent blockchain), and Wallet Backend (server storage). Each backend includes metadata format examples and trade-off tables. Updated §16.1 Overview with backend comparison table. Updated Appendix C.2 Encrypted Content Limits with chunk size, nonce length, and locator encryption details. Improves implementer guidance for encrypted NFT creation across different use cases (messages vs documents vs permanent archives). |
+| 2.0-draft-10 | 2026-04-26 | **Radiant Vault (CLTV Timelocking)**: Added cross-reference to new Radiant Vault feature in Photonic Wallet. Vault uses `OP_CHECKLOCKTIMEVERIFY` with P2SH wrapping for consensus-enforced timelocking of RXD, NFT (singleton ref preserved), and FT (conservation rules preserved). Supports simple lockup and vesting schedules (up to 12 tranches). Encrypted `OP_RETURN` metadata (XChaCha20-Poly1305) enables wallet recovery from seed. Note: Vault timelocking is distinct from §17 `GLYPH_TIMELOCK` (content encryption key reveals) — Vault locks *funds/tokens* at the UTXO level, while GLYPH_TIMELOCK locks *content decryption keys* at the metadata level. Full specification: `Radiant_Vault_Guide.md`. Implementation: `packages/lib/src/vault.ts` (1218 LOC, 48 tests). |
 | 2.0-draft-9 | 2026-04-01 | **V2 State Layout Reorder**: Reordered V2 dMint state layout to place `target` and `lastTime` at end (stack top) for natural PoW comparison and DAA access. Added `daaMode` as on-chain state item. Moved `halfLife`/`asymptote` to immutable bytecode constants. Updated §11.4.1 ASERT-lite and Linear DAA pseudocode with corrected stack positions (OP_2 PICK/OP_3 PICK). Updated §11.7 with V2 on-chain state layout table (10 items). Rewrote Appendix E.2 V2 bytecode template (3-part structure: Part A preimage, Part B PoW+DAA+cleanup, Part C output validation). Rewrote E.3 layout diagram with reordered fields and design decision notes. |
 | 2.0-draft-8 | 2026-02-12 | **Induction Proofs**: Added §11.8 Induction Proofs section covering Method 1 (reference-based, OP_PUSHINPUTREF family), Method 2 (TxId v3 preimage embedding with 112-byte layout), OP_PUSH_TX_STATE transaction state introspection (tx.state.txId, tx.state.inputSum, tx.state.outputSum), code-continuity induction pattern, and method comparison table. Added RadiantScript compiler support for tx.state.* nullary operators. Added InductionProof.rxd example contract. |
 | 2.0-draft-7 | 2026-02-12 | **Production Ready**: Updated status to Release Candidate. Added V2 hard fork summary to Executive Summary. Fixed §12.2 burn example (clarified fee source, added fee funding UTXO). Fixed §22.6 NFT content requirement to accept `main` shorthand (§8.4). Swapped §5 table rows (consensus MAX_TX_SIZE first). Added DAA mode string↔integer mapping table (§11.7). Added Linear DAA timestamp extraction note (§11.4.1). Added signature format/size table to §8.3. Clarified §14.3 child `p` array (CONTAINER is parent-only). Added §15.4 update ordering rules (tx index within block). Clarified §18.7 revocation `p:[10]` as action marker. Added GitHub repository URLs to §23.1. Updated Appendix E note (Phase 10 complete, bytecodes verified on regtest). |
