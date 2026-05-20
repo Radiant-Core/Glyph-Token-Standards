@@ -1,7 +1,7 @@
 # Glyph v2: A Unified Token Standard for the Radiant Blockchain
 
-**Version:** 2.0-draft-11  
-**Date:** April 2026  
+**Version:** 2.0-draft-12  
+**Date:** May 2026  
 **Status:** Release Candidate  
 
 ---
@@ -823,10 +823,10 @@ dMint enables proof-of-work token distribution:
 | ID | Mode | Description |
 |----|------|-------------|
 | 0x00 | Fixed | Static difficulty |
-| 0x01 | Epoch | Bitcoin-style periodic adjustment |
+| 0x01 | Epoch | Boundary-only adjustment using the last-mint delta (see §11.4.1 EPOCH for exact semantics — *not* classical Bitcoin's "time across the full epoch") |
 | 0x02 | ASERT | Exponential moving average |
 | 0x03 | LWMA | Linear weighted moving average |
-| 0x04 | Schedule | Predetermined difficulty curve |
+| 0x04 | Schedule | Predetermined target curve at fixed heights |
 
 ### 11.4 dMint Contract Variants
 
@@ -971,6 +971,99 @@ OP_DIV                     // [new_target, lastTime, targetTime, ...]
 OP_DUP OP_1 OP_LESSTHAN OP_IF OP_DROP OP_1 OP_ENDIF
 // → Part B.4 drops 5 V2 extras to normalize to V1 8-item stack
 ```
+
+#### EPOCH DAA (boundary-only adjustment)
+
+Adjusts difficulty only at block heights that are multiples of `epochLength`,
+preserving the target between boundaries. The adjustment uses the last-mint
+delta (`currentTime - lastTime`) — **not** the time elapsed across the entire
+epoch, which would require a new state field. This is documented in §11.3 as
+the canonical EPOCH semantic.
+
+Parameters (immutable per contract, embedded in bytecode):
+
+- `epochLength` (positive integer): number of blocks between adjustments
+- `maxAdjustmentLog2` ∈ {1, 2, 3, 4}: shift count for the clamp (1 → 2×, 2 → 4×, 3 → 8×, 4 → 16×). Restricted to powers of 2 so the clamp uses `OP_LSHIFT`/`OP_RSHIFT` instead of `OP_DIV`.
+
+Entry stack after Part B.2: `[target, lastTime, targetTime, daaMode, algoId, reward, maxHeight, tokenRef, contractRef, height, ...]`
+
+```
+// ── Boundary check: (height > 0) AND (height % epochLength == 0) ──
+OP_9 OP_PICK               // copy height (state pos 9)
+OP_DUP                     // dup for two checks
+OP_0 OP_GREATERTHAN        // height > 0?
+OP_SWAP                    // restore height_copy on top
+<epochLength>              // push embedded constant
+OP_MOD                     // height % epochLength
+OP_0 OP_NUMEQUAL           // mod == 0?
+OP_BOOLAND                 // combine: shouldAdjust
+OP_IF
+    // ── delta = currentTime - lastTime ──
+    OP_TXLOCKTIME           // [currentTime, target, lastTime, targetTime, ...]
+    OP_2 OP_PICK            // copy lastTime
+    OP_SUB                  // delta
+
+    // ── clamp delta to [targetTime>>N, targetTime<<N] ──
+    OP_3 OP_PICK <N> OP_LSHIFT   // upperBound = targetTime << N
+    OP_MIN                       // delta = min(delta, upperBound)
+    OP_3 OP_PICK <N> OP_RSHIFT   // lowerBound = targetTime >> N
+    OP_MAX                       // delta = max(delta, lowerBound)
+
+    // ── newTarget = target * clampedDelta / targetTime ──
+    OP_SWAP OP_MUL          // target * clampedDelta
+    OP_2 OP_PICK            // copy targetTime
+    OP_DIV                  // newTarget
+
+    // ── clamp newTarget to ≥1 ──
+    OP_DUP OP_1 OP_LESSTHAN OP_IF OP_DROP OP_1 OP_ENDIF
+OP_ENDIF
+// → Part B.4 drops 5 V2 extras to normalize to V1 8-item stack
+```
+
+**Opcode budget:** ~40–43 bytes for typical `epochLength` and `maxAdjustmentLog2`. The on-chain `OP_MOD` (0x97) keeps the boundary check compact (~5 bytes vs the ~13 bytes needed if it had to be synthesized via integer division).
+
+**Build-time constraint:** to avoid 64-bit overflow in `target * clampedDelta`, the wallet rejects contract deployment when `target > 2^48` and `daaMode == 'epoch'`. With the delta clamp bounding `clampedDelta ≤ targetTime × 16`, `target × clampedDelta` stays safely within `CScriptNum`'s 64-bit range.
+
+**Miner alignment:** [Glyph-miner `computeEpochTarget`](Glyph-miner/src/blockchain.ts) implements the same arithmetic in target space (not difficulty space) so the predicted next state matches what the on-chain bytecode computes byte-for-byte.
+
+#### SCHEDULE DAA (predetermined target curve)
+
+Adjusts target to a hard-coded value at predetermined heights — useful for token launches where the issuer wants a known difficulty schedule (e.g. "easy for the first 1000 blocks, then 5× harder, then 10× harder"). The schedule is immutable per contract and embedded directly in bytecode.
+
+Parameters:
+
+- `schedule`: 1–10 entries of `{ height, target }`, strictly ascending by height, all targets positive. Below the first boundary, the initial state target applies (no adjustment).
+
+The bytecode is a descending nested `IF`/`ELSE` chain — the highest boundary is the outermost check.
+
+Entry stack after Part B.2: `[target, lastTime, targetTime, daaMode, ..., height, ...]`
+
+Example for `[(1000, 500), (2000, 250), (5000, 100)]`:
+
+```
+OP_9 OP_PICK <5000> OP_GREATERTHANOREQUAL
+OP_IF
+    OP_DROP <100>          // drop old target, push schedule[2].target
+OP_ELSE
+    OP_9 OP_PICK <2000> OP_GREATERTHANOREQUAL
+    OP_IF
+        OP_DROP <250>      // schedule[1].target
+    OP_ELSE
+        OP_9 OP_PICK <1000> OP_GREATERTHANOREQUAL
+        OP_IF
+            OP_DROP <500>  // schedule[0].target
+        OP_ENDIF            // ← no ELSE on the innermost layer:
+                            // when height < 1000, the original target survives.
+    OP_ENDIF
+OP_ENDIF
+// → Part B.4 drops 5 V2 extras to normalize to V1 8-item stack
+```
+
+**Opcode budget:** ~10–13 bytes per entry. For the 10-entry maximum, ~125 bytes total. No multiplication, no division — pure conditional pushes.
+
+**Schedule cap:** maximum 10 entries in v1. Larger schedules can be split across multiple contracts. Wallet enforces this at build time.
+
+**Miner alignment:** [Glyph-miner `computeScheduleTarget`](Glyph-miner/src/blockchain.ts) walks the schedule descending and returns the first matching boundary's target.
 
 #### Security Constraints
 
