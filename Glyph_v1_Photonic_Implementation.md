@@ -559,7 +559,7 @@ function getTokenType(protocols: number[]): string {
 
 - **cbor-x** - CBOR encoding/decoding
 - **@noble/hashes** - SHA256 hashing
-- **@radiantblockchain/radiantjs** - Script parsing, transaction handling
+- **@radiant-core/radiantjs** - Script parsing, transaction handling
 - **@bitauth/libauth** - Data push encoding
 
 ---
