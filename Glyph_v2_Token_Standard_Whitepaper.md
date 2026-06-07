@@ -2337,7 +2337,7 @@ Indexers MUST reject and not index a Glyph if:
 - `name` exceeds 256 bytes
 - Protocol combination is invalid (see Section 3.5)
 - Any `content.*.hash.hex` is malformed (invalid hex, wrong length)
-- Total canonical metadata exceeds 256 KB
+- Total canonical metadata exceeds 640 KB (the decode cap — content limit + CBOR framing/headroom; see Appendix C)
 
 **Type-Specific Content Requirements**:
 
@@ -2356,6 +2356,23 @@ Indexers SHOULD index but flag as "malformed" if:
 - `content.*.size` doesn't match actual payload size
 
 Indexers MUST ignore unknown top-level keys and preserve them when re-serializing for updates.
+
+### 22.7 Wallet and Covenant Safety Patterns
+
+These patterns prevent the most common ways tokens are silently destroyed or transactions are rejected. They are enforcement obligations on wallets, indexers, and covenant authors — Radiant consensus does **not** backstop any of them.
+
+**Coin selection MUST exclude token-bearing UTXOs.** Spending an FT, NFT, or dMint contract UTXO as plain RXD funding (and sending it to a plain P2PKH change output) **silently and irreversibly burns the token** — the ref disappears, the holder is debited, and no error is raised. Every coin selector MUST treat any output whose locking script contains an `OP_PUSHINPUTREF`-family opcode (`0xd0`–`0xd3`, `0xd8`) in **opcode position** as non-spendable funding.
+
+- Detect this by **walking the script as an opcode stream**, skipping every push payload (`0x01`–`0x4b`, `0x4c`/`0x4d`/`0x4e`). A bare byte-substring scan for `0xd0`–`0xd8` false-positives on ~51% of honest P2PKH addresses (a random 20-byte pubkey hash usually contains one of those bytes as *payload*), so a naive scan both rejects good funding and is a DoS surface.
+- Treat a truncated/malformed push as token-bearing (refuse it) rather than admitting it as funding.
+
+**NFT conservation has no consensus "exactly one" rule.** Consensus enforces only (a) output refs ⊆ input refs and (b) the disallowed-siblings rule. It does **not** require a singleton to appear on any output — spending an NFT into a transaction with zero copies of its ref is a valid **burn**. "Exactly one forwarding output" is a property the wallet or covenant MUST enforce itself (e.g. `tx.outputs.length == 1` and `refOutputCount(ref) == 1`). A one-of-one has no recovery.
+
+**Covenant authors MUST avoid phantom refs.** Consensus scans every output `scriptPubKey` start-to-end for ref opcodes (`GetPushRefs`); when it lands on `0xd0`–`0xd3`/`0xd8` in opcode position it consumes the next 36 bytes as a ref. If a covenant embeds expected token bytecode (e.g. an FT epilogue) as **raw bytes**, a stray `0xd0`/`0xd8` inside it is read as a real ref that exists in no input, and the tx is rejected (`bad-txns-inputs-outputs-invalid-transaction-reference-operations`). Fix by **push-wrapping** the embedded template (each ref-range byte pushed as data, never executed) or comparing a `OP_HASH256` of the output bytecode instead of the raw bytes. Before broadcasting, walk the finished covenant with an opcode-aware walker and confirm the ref set is exactly the refs you authored.
+
+**An FT cannot be held in a foreign covenant; an NFT can.** An FT is welded to its `codeScriptHash` by the `e3`/`e4` conservation epilogue — it conserves only to outputs carrying its exact code-script, so a covenant must gate the FT's *spend path* (covenant prologue + intact `bd d0 <ref> dec0e9aa76e378e4a269e69d` epilogue + hash-compared settlement) rather than hold the FT in foreign script. An NFT is welded only to its 36-byte ref and *can* be held directly inside a covenant (`d8 <ref> 75 <covenant-logic>`).
+
+**Reveal scriptSig walkers MUST handle `OP_PUSHDATA4` (`0x4e`).** Deploys with embedded media carry CBOR bodies above the `OP_PUSHDATA2` 65,535-byte ceiling (the GLYPH dMint deploy reveal pushes a ~65,569-byte body via `0x4e`). A walker that handles only `0x01`–`0x4d` terminates at the `0x4e` byte, never finds the `gly` marker, and misclassifies the reveal as non-Glyph. Pair this with a pre-decode CBOR size cap set **above** the on-chain content limit (so a max-size embed still decodes) — see §22.6 / Appendix C.
 
 ---
 
@@ -2440,13 +2457,12 @@ See REP-3003 for comprehensive test vectors covering:
 | `desc` | 4 KB | UTF-8 encoded |
 | `path` | 512 bytes | UTF-8 encoded |
 | `mime` | 128 bytes | ASCII |
-| Total metadata | 256 KB | Canonical CBOR bytes |
+| Total metadata (decode cap) | 640 KB | Canonical CBOR bytes — set above the content limit so a max-size embed still decodes |
+| On-chain content | 512 KiB | `main.b` / inline files (per file **and** all on-chain files combined); matches Photonic `mintEmbedMaxBytes` / `GLYPH_INSCRIPTION_MAX_SIZE`. Larger media → IPFS/Arweave via remote files |
 | Commit envelope | 100 KB | Style A or B |
 | Reveal envelope (A) | 100 KB | OP_RETURN style |
-| Reveal envelope (B) | 12 MB | Limited by MAX_TX_SIZE |
+| Reveal envelope (B) | 12 MB | Hard ceiling, limited by MAX_TX_SIZE (not a content limit — see On-chain content) |
 | Update envelope | 64 KB | Incremental changes |
-| Inline file | 1 MB | Per file |
-| Total inline | 10 MB | All files combined |
 
 #### C.2 Encrypted Content Limits
 
