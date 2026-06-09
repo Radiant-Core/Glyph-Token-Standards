@@ -1,7 +1,7 @@
 # Glyph v2: A Unified Token Standard for the Radiant Blockchain
 
-**Version:** 2.0-draft-12  
-**Date:** May 2026  
+**Version:** 2.0-draft-13  
+**Date:** June 2026  
 **Status:** Release Candidate  
 
 ---
@@ -1448,6 +1448,138 @@ When `enforced: false`:
 - Marketplaces can enforce voluntarily
 - Community reputation for compliance
 
+The advisory path also covers PSRT / atomic-swap offers: a swap maker MAY splice the royalty output into the partially-signed transaction, but a taker using non-compliant software can omit it (the swap signature does not commit to the royalty output). For royalty NFTs, conforming wallets MUST instead use the listing/sale covenant of §13.6, which is unstrippable by the buyer at consensus.
+
+### 13.6 Unstrippable Listing/Sale Covenant
+
+This subsection defines a **normative standard extension** to §13.3: a sale covenant that makes a royalty unstrippable **by the buyer** at consensus, with **no maker signature** required.
+
+**Module:** `Photonic-Wallet/packages/lib/src/royaltyCovenant.ts`. See REP-3012.
+
+#### 13.6.1 Model
+
+A royalty-bearing NFT rests, at REST, in the ordinary `nftScript(owner, ref)` (§10.1); wallet discovery is unchanged. To **list it for sale**, the owner moves the singleton into the `royaltySaleScript(...)` covenant. The covenant *is* the new locking script and carries the **same singleton ref forward** (the consensus ref-conservation rule of §10.3 forces the ref into an output on every spend — the same mechanism `nftScript` relies on), so it is still the same NFT.
+
+The covenant bakes the **sale terms in as compiled constants**:
+
+- Because the buyer spends *that exact UTXO*, they cannot alter the price, the royalty amount(s), the seller payout script, or the royalty recipient script(s). The royalty is therefore **unstrippable by the buyer** — there is no taker-controlled output to omit or underpay.
+- Because authorization is the covenant logic itself (the buy path requires **no signature**), a listing is shareable as a **plain descriptor** (e.g. base64 JSON of the terms) rather than a partially-signed transaction. This is the defining contrast with the advisory PSRT/atomic-swap path of §13.5, where royalty enforcement depends on taker cooperation.
+
+This is a *listing* model: it binds the **buyer**, not the seller. See §13.6.8 for the normative scope of what it does and does not guarantee.
+
+#### 13.6.2 Covenant scriptPubKey Layout
+
+A conforming `royaltySaleScript` MUST emit exactly the following structure (bytes shown for a single royalty recipient; `<sellerPkh>` is 20 bytes, `<ref>` is the 36-byte little-endian singleton ref, and `<sellerScript>`/`<royScript>`, `<P>`/`<R>` are minimally-pushed literals):
+
+```
+d8 <ref> 75            OP_PUSHINPUTREFSINGLETON <ref> ; OP_DROP   (holds the NFT singleton)
+63                     OP_IF      ── cancel path (seller reclaims)
+   76 a914 <sellerPkh> 88 ac        P2PKH(seller)
+67                     OP_ELSE    ── buy path (anyone, if they pay)
+   00 cd <sellerScript> 88          output[0].scriptPubKey == seller payout
+   00 cc <P>  a2 69                 output[0].value >= P            (seller-committed price)
+   52 cd <royScript> 88             output[2].scriptPubKey == royalty recipient
+   52 cc <R>  a2 69                 output[2].value >= R            (seller-committed royalty)
+   51                               OP_1   (multiple recipients extend to output[3], [4], …)
+68                     OP_ENDIF
+```
+
+The leading `OP_PUSHINPUTREFSINGLETON <ref>` MUST be the **only** ref operand in the script (the cancel branch's seller pkh and the buy branch's `<P>`/`<R>`/script literals are pushed as data, never as ref opcodes), so the covenant collapses to one owner-stable scripthash under indexer ref-zeroing (§13.6.7).
+
+**Opcodes used:**
+
+| Opcode | Hex | Semantics in this covenant |
+|--------|-----|----------------------------|
+| `OP_PUSHINPUTREFSINGLETON` | `d8` | Takes a 36-byte immediate ref; asserts the singleton ref is present and pushes it (holds the NFT) |
+| `OP_DROP` | `75` | Discards the pushed ref |
+| `OP_IF` / `OP_ELSE` / `OP_ENDIF` | `63` / `67` / `68` | Branch selector: cancel (IF) vs buy (ELSE) |
+| `OP_DUP` / `OP_HASH160` / `OP_EQUALVERIFY` / `OP_CHECKSIG` | `76` / `a9` / `88` / `ac` | Standard P2PKH(seller) on the cancel path |
+| `OP_OUTPUTBYTECODE` | `cd` | Unary: pops an output index, pushes that output's `scriptPubKey` bytes |
+| `OP_OUTPUTVALUE` | `cc` | Unary: pops an output index, pushes that output's value (CScriptNum) |
+| `OP_GREATERTHANOREQUAL` | `a2` | Asserts `outputValue >= committed amount` |
+| `OP_VERIFY` | `69` | Fails the script unless the preceding `>=` is true |
+| `OP_1` | `51` | Pushes true to leave a truthy stack at the end of the buy path |
+
+`<P>` (price), `<R>` (royalty amount), and the output indices (`00` = `OP_0` for output 0, `52` = `OP_2` for output 2, …) are minimal pushes.
+
+#### 13.6.3 Output Ordering (Normative)
+
+A buy-completion transaction spending the covenant MUST place outputs in this order:
+
+```
+[ sellerPayout(0), nftToBuyer(1), royalties(2..), buyerChange(…) ]
+```
+
+| Output | Content | Covenant check |
+|--------|---------|----------------|
+| `0` | Seller payout | `scriptPubKey == sellerScript` AND `value >= P` |
+| `1` | NFT delivered to buyer (ordinary `nftScript(buyer, ref)`) | not pinned by the covenant; the ref is preserved by consensus ref-conservation |
+| `2 .. 2+n-1` | Royalty recipient(s), one output per recipient in listed order | `scriptPubKey == royScript[i]` AND `value >= R[i]` |
+| `2+n ..` | Buyer funding change | unconstrained |
+
+> **Relationship to §13.3.** §13.3's canonical ordering (NFT at output 0, seller at output 1) describes the *advisory* enforced-royalty / swap-offer convention. The listing covenant of this section uses its **own committed ordering** — seller payout at output 0, NFT at output 1, royalties from output 2 — and that ordering is the one bound into the script bytes. Implementations MUST follow the covenant's ordering when spending a `royaltySaleScript` UTXO; the §13.3 ordering does not apply to covenant spends.
+
+#### 13.6.4 Terms Binding and the No-Arithmetic Requirement
+
+`P` (price), `R` (royalty amount), the seller payout script, and the royalty recipient script(s) are **literals compiled into the scriptPubKey by the seller's wallet at list time**. The buyer spends that exact UTXO and cannot alter any of them without spending a *different* UTXO. The "sale price" is therefore whatever the seller committed to — not a value the buyer chooses in an output (the flaw in the earlier draft that read the price from a buyer-controlled `OP_OUTPUTVALUE`).
+
+`R = floor(P · bps / 10000)`, clamped by the optional `minimum`/`maximum`, is computed **off-chain** by the lister (§13.4) and embedded as a literal. The covenant performs **only equality and `>=` checks against constants — there is no arithmetic in the script**.
+
+> **Normative implementation requirement.** A conforming `royaltySaleScript` MUST NOT emit any arithmetic opcode (`OP_MUL`/`OP_DIV`/`OP_2MUL`/`OP_2DIV`/`OP_ADD`/`OP_SUB`, i.e. the `8d`/`8e`/`93`/`94`/`95`/`96` range); all royalty math is done off-chain at list time. The emitted bytes MUST be equality/`>=` only (`87`/`88`/`a2`/`cc`/`cd`). This deliberately sidesteps the known RadiantScript `OP_2MUL`/`OP_2DIV` (×2 / ÷2) MUL/DIV lowering miscompile, which cannot apply to a script that contains no multiplication or division.
+
+#### 13.6.5 Spend Paths
+
+- **Buy path (anyone).** scriptSig = a single `OP_0` (`00`, false), which drives `OP_IF` into the `OP_ELSE` branch. **No signature** is required; the covenant's payment checks are the authorization. The spend is accepted iff outputs satisfy §13.6.3.
+- **Cancel path (seller).** scriptSig = `<sig> <pubkey> OP_1`. The trailing `OP_1` (true) selects the `OP_IF` branch, which is a standard P2PKH(seller). The seller reclaims the NFT to an ordinary `nftScript(seller, ref)` at any time, bypassing the payment checks.
+
+#### 13.6.6 Multi-Recipient Royalty Splits
+
+When the NFT's royalty defines `splits`, the lister computes one absolute photon amount per recipient (summing to the total `R`, with the **last split absorbing the rounding remainder** so the parts sum exactly to the clamped total) and appends one constrained output per recipient. The covenant emits, for each recipient `i` (0-indexed), a check on `output[2 + i]`:
+
+```
+<2+i> cd <royScript[i]> 88   output[2+i].scriptPubKey == royScript[i]
+<2+i> cc <R[i]> a2 69        output[2+i].value >= R[i]
+```
+
+followed by the single trailing `OP_1`. Recipients with a computed amount of 0 are omitted. A conforming spend MUST place these royalty outputs contiguously starting at output 2, in the same order the covenant lists them.
+
+#### 13.6.7 Indexer and Discovery Considerations
+
+- A listed UTXO is recognized by the template `d8<ref:72>7563…67…68` (`isRoyaltySaleScript`); the singleton ref is recovered with `parseRoyaltySaleRef`, mapping the covenant UTXO back to its NFT.
+- Because the only ref operand is the leading `OP_PUSHINPUTREFSINGLETON`, an indexer's generic ref-zeroing (which zeroes `INPUT_REF_OP` operands but not `PUSHDATA`) collapses the cancel-branch P2PKH form to an owner-stable scripthash. However, the buy-branch literals (`P`, `R`, scripts) are **not** zeroed, so each *listing* hashes to a **unique** scripthash that cannot be enumerated by owner alone. Conforming wallets therefore SHOULD track their own listings locally (alongside the recovered terms needed to complete or cancel) rather than relying on by-owner indexer enumeration of listings. Indexers MAY expose a listing-discovery endpoint keyed on the recognized template + ref.
+
+#### 13.6.8 Wallet Conformance (Normative)
+
+- A conforming wallet **MUST** list a royalty-bearing NFT (one whose recorded metadata has `royalty.enforced: true`) via this covenant — moving it into `royaltySaleScript` — and **MUST** honor the NFT's recorded royalty terms when computing `P`, `R`, and the recipient script(s).
+- A conforming wallet **MUST reject or withhold** the plain-swap / advisory path (§13.5) for royalty NFTs, since that path lets a taker strip the royalty.
+- A conforming wallet **SHOULD** present an enforced-royalty listing as a shareable descriptor and **MUST** complete a purchase using the covenant's committed output ordering (§13.6.3).
+
+#### 13.6.9 Honest Limitations (Normative Scope)
+
+This covenant makes a royalty **unstrippable by the buyer** for any listing, and a conforming wallet always lists honoring the creator's recorded terms. It does **NOT**:
+
+- bind a **malicious seller** using non-conforming software, who could craft a listing with `R = 0` or with the royalty recipient set to themselves; nor
+- bind an **out-of-band gift** or any transfer with no sale (there is no buy transaction to constrain).
+
+Closing those gaps requires inducting the creator's terms into the NFT itself — an **always-on / inductive** covenant carried from mint, so that *every* spend (not just a buy from a listing) must honor the royalty. That is **out of scope** for this listing model and is identified as a candidate **future extension**.
+
+#### 13.6.10 Worked Example
+
+A creator mints an NFT with `royalty: { enforced: true, bps: 500, address: <royaltyAddr> }` (5%). The holder lists it for **`P` = 1,000,000 photons**.
+
+- `R = floor(1,000,000 · 500 / 10000) = 50,000` photons (no `minimum`/`maximum` clamp).
+- The wallet compiles `royaltySaleScript` with `sellerScript = P2PKH(seller)`, `P = 1_000_000`, `royScript[0] = P2PKH(royaltyAddr)`, `R[0] = 50_000`, and moves the NFT into it (LIST).
+- A buyer completes the sale with this output list:
+
+| Output | Recipient | Value (photons) |
+|--------|-----------|-----------------|
+| `0` | seller payout (`P2PKH(seller)`) | `≥ 1,000,000` |
+| `1` | NFT to buyer (`nftScript(buyer, ref)`) | dust (NFT value) |
+| `2` | royalty (`P2PKH(royaltyAddr)`) | `≥ 50,000` |
+| `3+` | buyer change | remainder |
+
+Any completion that omits output 2, underpays the royalty, redirects it, or underpays the seller is **rejected by consensus** (`OP_EQUALVERIFY` / `OP_VERIFY` on the corresponding check). The seller may instead spend the cancel path (`<sig> <pubkey> OP_1`) to reclaim the NFT to `nftScript(seller, ref)` at any time.
+
 ---
 
 ## 14. Containers and Collections
@@ -2309,7 +2441,7 @@ Mapping between v1 and v2 field names:
 
 ### 22.3 Royalty Bypass
 
-On-chain enforcement prevents bypass for compliant contracts. Non-enforced royalties rely on:
+On-chain enforcement prevents bypass for compliant contracts. For royalty NFTs, the listing/sale covenant of §13.6 makes the royalty **unstrippable by the buyer** at consensus (a buy spends a seller-committed UTXO with no maker signature), and conforming wallets MUST list via that covenant rather than the advisory swap path. Its residual scope — a malicious *seller* using non-conforming software, or an out-of-band gift — is documented normatively in §13.6.9. Non-enforced royalties rely on:
 - Marketplace enforcement
 - Community reputation
 - Economic incentives
@@ -2621,6 +2753,7 @@ OP_CAT                                  // concat halves
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.0-draft-13 | 2026-06-09 | **Unstrippable Royalty Listing/Sale Covenant**: Added §13.6 (subsections 13.6.1–13.6.10) specifying the seller-committed royalty sale covenant from `royaltyCovenant.ts` (`royaltySaleScript`): model and contrast with the advisory PSRT/swap path; full `OP_PUSHINPUTREFSINGLETON … OP_IF/OP_ELSE` scriptPubKey layout with an opcode table; normative output ordering `[ sellerPayout(0), nftToBuyer(1), royalties(2..), change ]`; seller-committed literal terms with a no-arithmetic requirement (sidesteps the rxdc OP_2MUL/OP_2DIV miscompile); buy (`OP_0`, no signature) and cancel (`<sig> <pubkey> OP_1`) spend paths; multi-recipient splits; indexer/discovery (`isRoyaltySaleScript`/`parseRoyaltySaleRef`); wallet conformance; honest scope limitations (unstrippable by buyer, not by a malicious seller or out-of-band gift; always-on inductive covenant noted as future work); and a worked example. Updated §13.5 to scope the advisory swap path and §22.3 to point at the covenant. |
 | 2.0-draft-11 | 2026-04-27 | **Encrypted Content Storage Backends**: Added comprehensive §16.5 Storage Backend Details covering four options: On-Chain (glyph) with 512 KB limit, IPFS (content-addressed), Arweave (permanent blockchain), and Wallet Backend (server storage). Each backend includes metadata format examples and trade-off tables. Updated §16.1 Overview with backend comparison table. Updated Appendix C.2 Encrypted Content Limits with chunk size, nonce length, and locator encryption details. Improves implementer guidance for encrypted NFT creation across different use cases (messages vs documents vs permanent archives). |
 | 2.0-draft-10 | 2026-04-26 | **Radiant Vault (CLTV Timelocking)**: Added cross-reference to new Radiant Vault feature in Photonic Wallet. Vault uses `OP_CHECKLOCKTIMEVERIFY` with P2SH wrapping for consensus-enforced timelocking of RXD, NFT (singleton ref preserved), and FT (conservation rules preserved). Supports simple lockup and vesting schedules (up to 12 tranches). Encrypted `OP_RETURN` metadata (XChaCha20-Poly1305) enables wallet recovery from seed. Note: Vault timelocking is distinct from §17 `GLYPH_TIMELOCK` (content encryption key reveals) — Vault locks *funds/tokens* at the UTXO level, while GLYPH_TIMELOCK locks *content decryption keys* at the metadata level. Full specification: `Radiant_Vault_Guide.md`. Implementation: `packages/lib/src/vault.ts` (1218 LOC, 48 tests). |
 | 2.0-draft-9 | 2026-04-01 | **V2 State Layout Reorder**: Reordered V2 dMint state layout to place `target` and `lastTime` at end (stack top) for natural PoW comparison and DAA access. Added `daaMode` as on-chain state item. Moved `halfLife`/`asymptote` to immutable bytecode constants. Updated §11.4.1 ASERT-lite and Linear DAA pseudocode with corrected stack positions (OP_2 PICK/OP_3 PICK). Updated §11.7 with V2 on-chain state layout table (10 items). Rewrote Appendix E.2 V2 bytecode template (3-part structure: Part A preimage, Part B PoW+DAA+cleanup, Part C output validation). Rewrote E.3 layout diagram with reordered fields and design decision notes. |
